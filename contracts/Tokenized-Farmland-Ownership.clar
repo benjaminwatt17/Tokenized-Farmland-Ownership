@@ -222,3 +222,87 @@
 (define-read-only (get-total-supply)
   (ft-get-supply farmland-token)
 )
+
+(define-map land-valuations
+  { land-id: uint }
+  { 
+    current-value-per-acre: uint,
+    last-updated: uint,
+    total-market-value: uint,
+    valuation-count: uint
+  }
+)
+
+(define-map valuation-history
+  { land-id: uint, valuation-index: uint }
+  {
+    value-per-acre: uint,
+    timestamp: uint,
+    total-value: uint
+  }
+)
+
+(define-public (update-land-valuation (land-id uint) (new-value-per-acre uint))
+  (let
+    (
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (current-valuation (default-to 
+        { current-value-per-acre: u0, last-updated: u0, total-market-value: u0, valuation-count: u0 }
+        (map-get? land-valuations { land-id: land-id })))
+      (new-total-value (* new-value-per-acre (get size-acres land-data)))
+      (new-valuation-count (+ (get valuation-count current-valuation) u1))
+    )
+    (asserts! (is-eq tx-sender (get owner land-data)) ERR_UNAUTHORIZED)
+    (asserts! (> new-value-per-acre u0) ERR_INVALID_AMOUNT)
+    (asserts! (get active land-data) ERR_LAND_NOT_FOUND)
+    
+    (map-set valuation-history
+      { land-id: land-id, valuation-index: new-valuation-count }
+      {
+        value-per-acre: new-value-per-acre,
+        timestamp: stacks-block-height,
+        total-value: new-total-value
+      }
+    )
+    
+    (map-set land-valuations
+      { land-id: land-id }
+      {
+        current-value-per-acre: new-value-per-acre,
+        last-updated: stacks-block-height,
+        total-market-value: new-total-value,
+        valuation-count: new-valuation-count
+      }
+    )
+    
+    (ok new-total-value)
+  )
+)
+
+(define-read-only (get-land-valuation (land-id uint))
+  (map-get? land-valuations { land-id: land-id })
+)
+
+(define-read-only (get-valuation-history (land-id uint) (valuation-index uint))
+  (map-get? valuation-history { land-id: land-id, valuation-index: valuation-index })
+)
+
+(define-read-only (calculate-token-value (land-id uint))
+  (let
+    (
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (valuation-data (unwrap! (map-get? land-valuations { land-id: land-id }) ERR_LAND_NOT_FOUND))
+    )
+    (ok (/ (get total-market-value valuation-data) (get total-tokens land-data)))
+  )
+)
+
+(define-read-only (get-portfolio-value (investor principal) (land-id uint))
+  (let
+    (
+      (investor-data (unwrap! (map-get? investor-holdings { investor: investor, land-id: land-id }) ERR_INSUFFICIENT_BALANCE))
+      (token-value (unwrap! (calculate-token-value land-id) ERR_LAND_NOT_FOUND))
+    )
+    (ok (* (get tokens-held investor-data) token-value))
+  )
+)
