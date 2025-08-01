@@ -8,6 +8,14 @@
 (define-constant ERR_NO_PROFITS (err u106))
 (define-constant ERR_TRANSFER_FAILED (err u107))
 
+(define-constant ERR_MILESTONE_NOT_REACHED (err u108))
+(define-constant ERR_INVALID_MILESTONE (err u109))
+(define-constant ERR_SEASON_COMPLETE (err u110))
+
+(define-constant MILESTONE_PLANTED u1)
+(define-constant MILESTONE_GROWING u2)
+(define-constant MILESTONE_HARVESTED u3)
+
 (define-fungible-token farmland-token)
 
 (define-map land-parcels
@@ -304,5 +312,105 @@
       (token-value (unwrap! (calculate-token-value land-id) ERR_LAND_NOT_FOUND))
     )
     (ok (* (get tokens-held investor-data) token-value))
+  )
+)
+
+
+(define-map farming-milestones
+  { land-id: uint }
+  {
+    current-milestone: uint,
+    season-year: uint,
+    planted-block: uint,
+    growing-block: uint,
+    harvested-block: uint,
+    growing-duration: uint,
+    harvest-duration: uint
+  }
+)
+
+(define-public (initialize-farming-season (land-id uint) (growing-duration uint) (harvest-duration uint))
+  (let
+    (
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (existing-milestone (default-to 
+        { current-milestone: u0, season-year: u0, planted-block: u0, growing-block: u0, harvested-block: u0, growing-duration: u0, harvest-duration: u0 }
+        (map-get? farming-milestones { land-id: land-id })))
+      (current-season (get season-year existing-milestone))
+    )
+    (asserts! (is-eq tx-sender (get owner land-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active land-data) ERR_LAND_NOT_FOUND)
+    (asserts! (> growing-duration u0) ERR_INVALID_AMOUNT)
+    (asserts! (> harvest-duration u0) ERR_INVALID_AMOUNT)
+    
+    (map-set farming-milestones
+      { land-id: land-id }
+      {
+        current-milestone: MILESTONE_PLANTED,
+        season-year: (+ current-season u1),
+        planted-block: stacks-block-height,
+        growing-block: u0,
+        harvested-block: u0,
+        growing-duration: growing-duration,
+        harvest-duration: harvest-duration
+      }
+    )
+    
+    (ok MILESTONE_PLANTED)
+  )
+)
+
+(define-public (advance-milestone (land-id uint))
+  (let
+    (
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (milestone-data (unwrap! (map-get? farming-milestones { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (current-milestone (get current-milestone milestone-data))
+    )
+    (asserts! (is-eq tx-sender (get owner land-data)) ERR_UNAUTHORIZED)
+    (asserts! (< current-milestone MILESTONE_HARVESTED) ERR_SEASON_COMPLETE)
+    
+    (if (is-eq current-milestone MILESTONE_PLANTED)
+      (begin
+        (asserts! (>= (- stacks-block-height (get planted-block milestone-data)) (get growing-duration milestone-data)) ERR_MILESTONE_NOT_REACHED)
+        (map-set farming-milestones
+          { land-id: land-id }
+          (merge milestone-data { current-milestone: MILESTONE_GROWING, growing-block: stacks-block-height })
+        )
+        (ok MILESTONE_GROWING)
+      )
+      (if (is-eq current-milestone MILESTONE_GROWING)
+        (begin
+          (asserts! (>= (- stacks-block-height (get growing-block milestone-data)) (get harvest-duration milestone-data)) ERR_MILESTONE_NOT_REACHED)
+          (map-set farming-milestones
+            { land-id: land-id }
+            (merge milestone-data { current-milestone: MILESTONE_HARVESTED, harvested-block: stacks-block-height })
+          )
+          (ok MILESTONE_HARVESTED)
+        )
+        ERR_INVALID_MILESTONE
+      )
+    )
+  )
+)
+
+(define-public (distribute-harvest-profits (land-id uint) (total-profit uint))
+  (let
+    (
+      (milestone-data (unwrap! (map-get? farming-milestones { land-id: land-id }) ERR_LAND_NOT_FOUND))
+    )
+    (asserts! (is-eq (get current-milestone milestone-data) MILESTONE_HARVESTED) ERR_MILESTONE_NOT_REACHED)
+    (distribute-profits land-id total-profit)
+  )
+)
+
+(define-read-only (get-farming-milestone (land-id uint))
+  (map-get? farming-milestones { land-id: land-id })
+)
+
+(define-read-only (is-harvest-ready (land-id uint))
+  (match (map-get? farming-milestones { land-id: land-id })
+    milestone-data (ok (is-eq (get current-milestone milestone-data) MILESTONE_HARVESTED))
+    (ok false)
   )
 )
