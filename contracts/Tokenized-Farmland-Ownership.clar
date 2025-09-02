@@ -16,6 +16,10 @@
 (define-constant MILESTONE_GROWING u2)
 (define-constant MILESTONE_HARVESTED u3)
 
+(define-constant INSURANCE_PREMIUM_RATE u250)
+(define-constant MAX_CLAIM_PERCENTAGE u8000)
+(define-constant MIN_POOL_BALANCE u1000000)
+
 (define-fungible-token farmland-token)
 
 (define-map land-parcels
@@ -412,5 +416,119 @@
   (match (map-get? farming-milestones { land-id: land-id })
     milestone-data (ok (is-eq (get current-milestone milestone-data) MILESTONE_HARVESTED))
     (ok false)
+  )
+)
+
+
+(define-map insurance-pools
+  { land-id: uint }
+  {
+    total-premiums: uint,
+    total-claims: uint,
+    active-contributors: uint,
+    pool-balance: uint,
+    last-claim-block: uint
+  }
+)
+
+(define-map investor-insurance
+  { investor: principal, land-id: uint }
+  {
+    premiums-paid: uint,
+    coverage-amount: uint,
+    last-premium-block: uint,
+    has-active-coverage: bool
+  }
+)
+
+(define-public (pay-insurance-premium (land-id uint))
+  (let
+    (
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (investor-data (unwrap! (map-get? investor-holdings { investor: tx-sender, land-id: land-id }) ERR_INSUFFICIENT_BALANCE))
+      (premium-amount (/ (* (get tokens-held investor-data) INSURANCE_PREMIUM_RATE) u10000))
+      (current-pool (default-to { total-premiums: u0, total-claims: u0, active-contributors: u0, pool-balance: u0, last-claim-block: u0 }
+                                (map-get? insurance-pools { land-id: land-id })))
+      (current-insurance (default-to { premiums-paid: u0, coverage-amount: u0, last-premium-block: u0, has-active-coverage: false }
+                                    (map-get? investor-insurance { investor: tx-sender, land-id: land-id })))
+      (coverage-amount (/ (* (get tokens-held investor-data) (get price-per-token land-data) u80) u100))
+    )
+    (asserts! (> (get tokens-held investor-data) u0) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> premium-amount u0) ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set insurance-pools
+      { land-id: land-id }
+      {
+        total-premiums: (+ (get total-premiums current-pool) premium-amount),
+        total-claims: (get total-claims current-pool),
+        active-contributors: (if (get has-active-coverage current-insurance) 
+                               (get active-contributors current-pool)
+                               (+ (get active-contributors current-pool) u1)),
+        pool-balance: (+ (get pool-balance current-pool) premium-amount),
+        last-claim-block: (get last-claim-block current-pool)
+      }
+    )
+    
+    (map-set investor-insurance
+      { investor: tx-sender, land-id: land-id }
+      {
+        premiums-paid: (+ (get premiums-paid current-insurance) premium-amount),
+        coverage-amount: coverage-amount,
+        last-premium-block: stacks-block-height,
+        has-active-coverage: true
+      }
+    )
+    
+    (ok premium-amount)
+  )
+)
+
+(define-public (file-insurance-claim (land-id uint) (claim-amount uint))
+  (let
+    (
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (current-pool (unwrap! (map-get? insurance-pools { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (investor-insurance-data (unwrap! (map-get? investor-insurance { investor: tx-sender, land-id: land-id }) ERR_INSUFFICIENT_BALANCE))
+      (max-claimable (/ (* (get coverage-amount investor-insurance-data) MAX_CLAIM_PERCENTAGE) u10000))
+    )
+    (asserts! (get has-active-coverage investor-insurance-data) ERR_UNAUTHORIZED)
+    (asserts! (<= claim-amount max-claimable) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get pool-balance current-pool) claim-amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> (- stacks-block-height (get last-premium-block investor-insurance-data)) u144) ERR_MILESTONE_NOT_REACHED)
+    
+    (try! (as-contract (stx-transfer? claim-amount tx-sender tx-sender)))
+    
+    (map-set insurance-pools
+      { land-id: land-id }
+      (merge current-pool {
+        total-claims: (+ (get total-claims current-pool) claim-amount),
+        pool-balance: (- (get pool-balance current-pool) claim-amount),
+        last-claim-block: stacks-block-height
+      })
+    )
+    
+    (map-set investor-insurance
+      { investor: tx-sender, land-id: land-id }
+      (merge investor-insurance-data { has-active-coverage: false })
+    )
+    
+    (ok claim-amount)
+  )
+)
+
+(define-read-only (get-insurance-pool (land-id uint))
+  (map-get? insurance-pools { land-id: land-id })
+)
+
+(define-read-only (get-investor-insurance (investor principal) (land-id uint))
+  (map-get? investor-insurance { investor: investor, land-id: land-id })
+)
+
+(define-read-only (calculate-premium-cost (investor principal) (land-id uint))
+  (match (map-get? investor-holdings { investor: investor, land-id: land-id })
+    holding-data (ok (/ (* (get tokens-held holding-data) INSURANCE_PREMIUM_RATE) u10000))
+    ERR_INSUFFICIENT_BALANCE
   )
 )
