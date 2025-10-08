@@ -20,6 +20,12 @@
 (define-constant MAX_CLAIM_PERCENTAGE u8000)
 (define-constant MIN_POOL_BALANCE u1000000)
 
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u111))
+(define-constant ERR_ALREADY_VOTED (err u112))
+(define-constant ERR_PROPOSAL_CLOSED (err u113))
+(define-constant ERR_PROPOSAL_ACTIVE (err u114))
+(define-constant ERR_QUORUM_NOT_REACHED (err u115))
+
 (define-fungible-token farmland-token)
 
 (define-map land-parcels
@@ -531,4 +537,111 @@
     holding-data (ok (/ (* (get tokens-held holding-data) INSURANCE_PREMIUM_RATE) u10000))
     ERR_INSUFFICIENT_BALANCE
   )
+)
+
+(define-map governance-proposals
+  { land-id: uint, proposal-id: uint }
+  {
+    proposer: principal,
+    title: (string-ascii 100),
+    votes-for: uint,
+    votes-against: uint,
+    total-votes: uint,
+    end-block: uint,
+    executed: bool,
+    quorum-threshold: uint,
+    approval-threshold: uint
+  }
+)
+
+(define-map proposal-votes
+  { land-id: uint, proposal-id: uint, voter: principal }
+  { vote-weight: uint, support: bool }
+)
+
+(define-data-var next-proposal-id uint u1)
+
+(define-public (create-proposal (land-id uint) (title (string-ascii 100)) (voting-blocks uint) (quorum-pct uint) (approval-pct uint))
+  (let
+    (
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (proposal-id (var-get next-proposal-id))
+    )
+    (asserts! (is-eq tx-sender (get owner land-data)) ERR_UNAUTHORIZED)
+    (asserts! (> voting-blocks u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= quorum-pct u10000) ERR_INVALID_PERCENTAGE)
+    (asserts! (<= approval-pct u10000) ERR_INVALID_PERCENTAGE)
+    
+    (map-set governance-proposals
+      { land-id: land-id, proposal-id: proposal-id }
+      {
+        proposer: tx-sender,
+        title: title,
+        votes-for: u0,
+        votes-against: u0,
+        total-votes: u0,
+        end-block: (+ stacks-block-height voting-blocks),
+        executed: false,
+        quorum-threshold: quorum-pct,
+        approval-threshold: approval-pct
+      }
+    )
+    (var-set next-proposal-id (+ proposal-id u1))
+    (ok proposal-id)
+  )
+)
+
+(define-public (cast-vote (land-id uint) (proposal-id uint) (support bool))
+  (let
+    (
+      (proposal (unwrap! (map-get? governance-proposals { land-id: land-id, proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (investor-data (unwrap! (map-get? investor-holdings { investor: tx-sender, land-id: land-id }) ERR_INSUFFICIENT_BALANCE))
+      (vote-weight (get tokens-held investor-data))
+    )
+    (asserts! (< stacks-block-height (get end-block proposal)) ERR_PROPOSAL_CLOSED)
+    (asserts! (is-none (map-get? proposal-votes { land-id: land-id, proposal-id: proposal-id, voter: tx-sender })) ERR_ALREADY_VOTED)
+    (asserts! (> vote-weight u0) ERR_INSUFFICIENT_BALANCE)
+    
+    (map-set proposal-votes
+      { land-id: land-id, proposal-id: proposal-id, voter: tx-sender }
+      { vote-weight: vote-weight, support: support }
+    )
+    
+    (map-set governance-proposals
+      { land-id: land-id, proposal-id: proposal-id }
+      (merge proposal {
+        votes-for: (if support (+ (get votes-for proposal) vote-weight) (get votes-for proposal)),
+        votes-against: (if support (get votes-against proposal) (+ (get votes-against proposal) vote-weight)),
+        total-votes: (+ (get total-votes proposal) vote-weight)
+      })
+    )
+    (ok vote-weight)
+  )
+)
+
+(define-public (execute-proposal (land-id uint) (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? governance-proposals { land-id: land-id, proposal-id: proposal-id }) ERR_PROPOSAL_NOT_FOUND))
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (total-tokens (get tokens-sold land-data))
+      (quorum-reached (>= (* (get total-votes proposal) u10000) (* total-tokens (get quorum-threshold proposal))))
+      (approval-reached (>= (* (get votes-for proposal) u10000) (* (get total-votes proposal) (get approval-threshold proposal))))
+    )
+    (asserts! (>= stacks-block-height (get end-block proposal)) ERR_PROPOSAL_ACTIVE)
+    (asserts! (not (get executed proposal)) ERR_PROPOSAL_CLOSED)
+    (asserts! quorum-reached ERR_QUORUM_NOT_REACHED)
+    (asserts! approval-reached ERR_UNAUTHORIZED)
+    
+    (map-set governance-proposals { land-id: land-id, proposal-id: proposal-id } (merge proposal { executed: true }))
+    (ok true)
+  )
+)
+
+(define-read-only (get-proposal (land-id uint) (proposal-id uint))
+  (map-get? governance-proposals { land-id: land-id, proposal-id: proposal-id })
+)
+
+(define-read-only (get-vote (land-id uint) (proposal-id uint) (voter principal))
+  (map-get? proposal-votes { land-id: land-id, proposal-id: proposal-id, voter: voter })
 )
