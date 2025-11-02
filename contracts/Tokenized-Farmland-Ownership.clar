@@ -26,6 +26,10 @@
 (define-constant ERR_PROPOSAL_ACTIVE (err u114))
 (define-constant ERR_QUORUM_NOT_REACHED (err u115))
 
+(define-constant ERR_STAKE_NOT_FOUND (err u116))
+(define-constant ERR_STAKE_LOCKED (err u117))
+(define-constant ERR_STAKE_EXISTS (err u118))
+
 (define-fungible-token farmland-token)
 
 (define-map land-parcels
@@ -644,4 +648,120 @@
 
 (define-read-only (get-vote (land-id uint) (proposal-id uint) (voter principal))
   (map-get? proposal-votes { land-id: land-id, proposal-id: proposal-id, voter: voter })
+)
+
+(define-map staked-tokens
+  { staker: principal, land-id: uint }
+  {
+    tokens-staked: uint,
+    stake-start-block: uint,
+    stake-duration-blocks: uint,
+    reward-multiplier: uint,
+    claimed-rewards: uint
+  }
+)
+
+(define-map staking-pools
+  { land-id: uint }
+  {
+    total-staked: uint,
+    total-stakers: uint,
+    reward-pool-balance: uint,
+    base-reward-rate: uint
+  }
+)
+
+(define-public (stake-tokens (land-id uint) (token-amount uint) (duration-blocks uint))
+  (let
+    (
+      (land-data (unwrap! (map-get? land-parcels { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (investor-data (unwrap! (map-get? investor-holdings { investor: tx-sender, land-id: land-id }) ERR_INSUFFICIENT_BALANCE))
+      (existing-stake (map-get? staked-tokens { staker: tx-sender, land-id: land-id }))
+      (reward-multiplier (if (>= duration-blocks u4320) u150 (if (>= duration-blocks u2016) u125 u100)))
+      (current-pool (default-to { total-staked: u0, total-stakers: u0, reward-pool-balance: u0, base-reward-rate: u500 }
+                                (map-get? staking-pools { land-id: land-id })))
+    )
+    (asserts! (is-none existing-stake) ERR_STAKE_EXISTS)
+    (asserts! (>= (get tokens-held investor-data) token-amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> token-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= duration-blocks u144) ERR_INVALID_AMOUNT)
+    (asserts! (get active land-data) ERR_LAND_NOT_FOUND)
+    
+    (map-set staked-tokens
+      { staker: tx-sender, land-id: land-id }
+      {
+        tokens-staked: token-amount,
+        stake-start-block: stacks-block-height,
+        stake-duration-blocks: duration-blocks,
+        reward-multiplier: reward-multiplier,
+        claimed-rewards: u0
+      }
+    )
+    
+    (map-set staking-pools
+      { land-id: land-id }
+      {
+        total-staked: (+ (get total-staked current-pool) token-amount),
+        total-stakers: (+ (get total-stakers current-pool) u1),
+        reward-pool-balance: (get reward-pool-balance current-pool),
+        base-reward-rate: (get base-reward-rate current-pool)
+      }
+    )
+    
+    (ok token-amount)
+  )
+)
+
+(define-public (unstake-tokens (land-id uint))
+  (let
+    (
+      (stake-data (unwrap! (map-get? staked-tokens { staker: tx-sender, land-id: land-id }) ERR_STAKE_NOT_FOUND))
+      (current-pool (unwrap! (map-get? staking-pools { land-id: land-id }) ERR_LAND_NOT_FOUND))
+      (stake-end-block (+ (get stake-start-block stake-data) (get stake-duration-blocks stake-data)))
+      (reward-amount (unwrap! (calculate-stake-reward tx-sender land-id) ERR_INVALID_AMOUNT))
+    )
+    (asserts! (>= stacks-block-height stake-end-block) ERR_STAKE_LOCKED)
+    
+    (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+    
+    (map-delete staked-tokens { staker: tx-sender, land-id: land-id })
+    
+    (map-set staking-pools
+      { land-id: land-id }
+      {
+        total-staked: (- (get total-staked current-pool) (get tokens-staked stake-data)),
+        total-stakers: (- (get total-stakers current-pool) u1),
+        reward-pool-balance: (get reward-pool-balance current-pool),
+        base-reward-rate: (get base-reward-rate current-pool)
+      }
+    )
+    
+    (ok reward-amount)
+  )
+)
+
+(define-read-only (calculate-stake-reward (staker principal) (land-id uint))
+  (match (map-get? staked-tokens { staker: staker, land-id: land-id })
+    stake-data
+      (match (map-get? staking-pools { land-id: land-id })
+        pool-data
+          (let
+            (
+              (base-reward (/ (* (get tokens-staked stake-data) (get base-reward-rate pool-data)) u10000))
+              (multiplier-bonus (/ (* base-reward (- (get reward-multiplier stake-data) u100)) u100))
+            )
+            (ok (+ base-reward multiplier-bonus))
+          )
+        ERR_LAND_NOT_FOUND
+      )
+    ERR_STAKE_NOT_FOUND
+  )
+)
+
+(define-read-only (get-stake-info (staker principal) (land-id uint))
+  (map-get? staked-tokens { staker: staker, land-id: land-id })
+)
+
+(define-read-only (get-staking-pool-info (land-id uint))
+  (map-get? staking-pools { land-id: land-id })
 )
